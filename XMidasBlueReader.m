@@ -265,7 +265,7 @@ classdef XMidasBlueReader < handle
                 
                 % Calculate remainder for 8-byte boundary
                 total = 4 + 2 + 1 + 1 + (key.lkey - key.lext) + key.ltag;
-                remainder = 8 - rem(total, 8);
+                remainder = rem(8 - rem(total, 8), 8);
                 if remainder > 0
                     fseek(fid, remainder, 'cof');
                 end
