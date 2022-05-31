@@ -14,11 +14,16 @@ classdef XMidasBlueReader < handle
     end
     
     methods
-        function obj = XMidasBlueReader(bluefile)
+        function obj = XMidasBlueReader(bluefile, fileTypeOverride)
             %XMIDASBLUEREADER Construct a reader for the bluefile
             %   Creates a class that progressively reads samples from
             %   an X-Midas BLUE file
             obj.bluefile = bluefile;
+
+            % Disable override by default
+            if nargin < 2
+                fileTypeOverride = [];
+            end
             
             % Open the file, read headers
             [fid, msg] = fopen(obj.bluefile, 'r');
@@ -26,20 +31,86 @@ classdef XMidasBlueReader < handle
                 disp(msg)
                 return
             end
-            obj.hcb = XMidasBlueReader.HCB(fid);
+            obj.hcb = XMidasBlueReader.HCB(fid, fileTypeOverride);
             obj.ext_header = XMidasBlueReader.ExtendedHeader(fid, obj.hcb);
             obj.resetRead();
             
             % Close file.
             fclose(fid);
         end
-        
+
         function [samples] = read(obj, numSamples)
+                switch obj.hcb.type
+                    case {1000, 2000}
+                        samples = obj.read1k2k(numSamples);
+                    case 3000
+                        samples = obj.read3k(numSamples);
+                end
+        end
+        
+
+
+        function resetRead(obj)
+            %RESETREAD Resets the read pointer back to the start
+            %    Moves data read pointer to the start of data.
+            obj.dataOffset = obj.hcb.data_start;
+        end
+        
+        function rewind(obj, numSamples)
+            %REWIND Move the data playback backwards.
+            %   Changes the data offset to go back an appropriate number
+            %   of bytes based on the data information in header.
+            
+            % Treat no argument as shorthand for fully rewind.
+            if nargin < 1
+                obj.resetRead();
+                return
+            end
+            
+            % If already rewound, no reason to do anything.
+            if obj.dataOffset == obj.hcb.data_start
+                return;
+            end
+            
+            if (obj.hcb.type == 3000)
+                % Set bytes per sample to record size
+                bytesPerSample = obj.hcb.adjunct.record_length;
+            else
+                % Convert format size to number of elements per sample
+                elementsPerSample = XMidasBlueReader.FormatSize(obj.hcb.format(1));
+                % Convert format type to the type string and size (bytes)
+                [~, elementPrecisionBytes] = XMidasBlueReader.FormatType(obj.hcb.format(2));
+                bytesPerSample = elementPrecisionBytes * prod(elementsPerSample);
+            end
+            
+            % Move backwards stopping at the data 
+            moveBytes = bytesPerSample * numSamples;
+            obj.dataOffset = max([obj.dataOffset - moveBytes, obj.hcb.data_start]);
+        end
+        
+        function b = begin(obj)
+            %BEGIN Returns true if at beginning of data
+            %    Returns true if the internal data pointer is at the
+            %    beginning of the data according to the header.
+            b = obj.dataOffset == obj.hcb.data_start;
+        end
+        
+        function f = end(obj)
+            %END Returns true if at the end of the data
+            %    Returns true if the internal data pointer is at the
+            %    end of the data according to the header.
+            f = obj.dataOffset == (obj.hcb.data_start + obj.hcb.data_size);
+        end
+    end
+    
+    methods(Access = private)
+
+        function [samples] = read1k2k(obj, numSamples)
             %READ Read numSamples from the current position.
             %   Returns a vector or matrix of the data according to the
             %   hcb information.
             if nargin < 2
-                numSmaples = 1;
+                numSamples = 1;
             end
             
             % Open the file, skip to read pointer
@@ -96,56 +167,50 @@ classdef XMidasBlueReader < handle
             fclose(fid);
         end
         
-        function resetRead(obj)
-            %RESETREAD Resets the read pointer back to the start
-            %    Moves data read pointer to the start of data.
-            obj.dataOffset = obj.hcb.data_start;
-        end
-        
-        function rewind(obj, numSamples)
-            %REWIND Move the data playback backwards.
-            %   Changes the data offset to go back an appropriate number
-            %   of bytes based on the data information in header.
-            
-            % Treat no argument as shorthand for fully rewind.
-            if nargin < 1
-                obj.resetRead();
-                return
+        function [samples] = read3k(obj, numSamples)
+
+            %READ Read numSamples from the current position.
+            %   Returns a vector or matrix of the data according to the
+            %   hcb information.
+            if nargin < 2
+                numSamples = 1;
             end
             
-            % If already rewound, no reason to do anything.
-            if obj.dataOffset == obj.hcb.data_start
-                return;
+            % Open the file, skip to read pointer
+            [fid, msg] = fopen(obj.bluefile, 'r');
+            if fid < 0
+                throw(MException(...
+                    'XMidasBlueReader:Read', ...
+                    sprintf('Unable to read file: %s', msg)));
             end
-            
-            % Convert format size to number of elements per sample
-            elementsPerSample = XMidasBlueReader.FormatSize(obj.hcb.format(1));
-            % Convert format type to the type string and size (bytes)
-            [~, elementPrecisionBytes] = XMidasBlueReader.FormatType(obj.hcb.format(2));
-            bytesPerSample = elementPrecisionBytes * prod(elementsPerSample);
-            
-            % Move backwards stopping at the data 
-            moveBytes = bytesPerSample * numSamples;
-            obj.dataOffset = max([obj.dataOffset - moveBytes, obj.hcb.data_start]);
-        end
-        
-        function b = begin(obj)
-            %BEGIN Returns true if at beginning of data
-            %    Returns true if the internal data pointer is at the
-            %    beginning of the data according to the header.
-            b = obj.dataOffset == obj.hcb.data_start;
-        end
-        
-        function f = end(obj)
-            %END Returns true if at the end of the data
-            %    Returns true if the internal data pointer is at the
-            %    end of the data according to the header.
-            f = obj.dataOffset == (obj.hcb.data_start + obj.hcb.data_size);
+
+            % Move read position.
+            fseek(fid, obj.dataOffset, 'bof');
+
+            lastSample = obj.hcb.data_start + obj.hcb.data_size - obj.hcb.adjunct.record_length;
+            for r = 1:numSamples
+                if (ftell(fid) > lastSample)
+                    break;
+                end
+                for s = 1:length(obj.hcb.adjunct.subr)
+                    subrecName = replace(obj.hcb.adjunct.subr(s).name, {' ', '(', ')'}, '');
+                    if (s == 1)
+                        samples(r).(subrecName) = obj.hcb.adjunct.rstart + obj.hcb.adjunct.rdelta * fread(fid, obj.hcb.adjunct.subr(s).numElements, obj.hcb.adjunct.subr(s).readType);
+                    elseif (obj.hcb.adjunct.subr(s).typeCode(2) == 'O')
+                        samples(r).(subrecName) = fread(fid, obj.hcb.adjunct.subr(s).numElements, obj.hcb.adjunct.subr(s).readType) - 128;
+                    else
+                        samples(r).(subrecName) = fread(fid, obj.hcb.adjunct.subr(s).numElements, obj.hcb.adjunct.subr(s).readType);
+                    end
+                end
+            end
+
+            % Save file read location
+            obj.dataOffset = ftell(fid);
         end
     end
-    
+
     methods(Static)
-        function [hcb] = HCB(fid)
+        function [hcb] = HCB(fid, fileTypeOverride)
             %HCB Reads a hcb control block structure
             %    Uses the file descriptor to read the hcb Control Block of an
             %    X-Midas BLUE file.  If no file handle is provided, it
@@ -194,9 +259,12 @@ classdef XMidasBlueReader < handle
             hcb.data_start = fread(fid, 1, 'double');
             hcb.data_size = fread(fid, 1, 'double');
             hcb.type = fread(fid, 1, 'int32');
+            if ~isempty(fileTypeOverride)
+                hcb.type = fileTypeOverride;
+            end
 
             % Check the type for ones we support.
-            if ~ismember(hcb.type, [1000, 2000])
+            if ~ismember(hcb.type, [1000, 2000, 3000])
                 e = MException(...
                     'BLUE:HCBType', ...
                     sprintf('Unsupported HCB.type: %d', hcb.type));
@@ -235,6 +303,28 @@ classdef XMidasBlueReader < handle
                         'ydelta',  fread(fid, 1, 'double'), ...
                         'yunits',  fread(fid, 1, 'int32') ...
                         );
+                case 3000
+                    hcb.adjunct = struct(...
+                        'rstart',  fread(fid, 1, 'double'), ...
+                        'rdelta',  fread(fid, 1, 'double'), ...
+                        'runits',  fread(fid, 1, 'int32'), ...
+                        'subrecords', fread(fid, 1, 'int32'), ...
+                        'r2start', fread(fid, 1, 'double'), ...
+                        'r2delta', fread(fid, 1, 'double'), ...
+                        'r2units', fread(fid, 1, 'int32'), ...
+                        'record_length', fread(fid, 1, 'int32') ...
+                        );
+                        for i = 1:hcb.adjunct.subrecords
+                            hcb.adjunct.subr(i) = struct(...
+                                'name', fread(fid, 4, '*char')', ...
+                                'typeCode', fread(fid, 2, '*char')', ...
+                                'offset', fread(fid, 1, 'int16'), ...
+                                'readType', '', ...
+                                'numElements', 0.0 ...
+                                );
+                            hcb.adjunct.subr(i).readType = XMidasBlueReader.FormatType(hcb.adjunct.subr(i).typeCode(2));
+                            hcb.adjunct.subr(i).numElements = XMidasBlueReader.FormatSize(hcb.adjunct.subr(i).typeCode(1));
+                        end
             end
         end % end HCB
     
@@ -284,6 +374,10 @@ classdef XMidasBlueReader < handle
                 case 'B'
                     % 8-bit int
                     typeStr = 'int8';
+                    bytes = 1;
+                case 'O'
+                    % Ridiculous offset format
+                    typeStr = 'uint8';
                     bytes = 1;
                 case 'I'
                     % 16-bit int
